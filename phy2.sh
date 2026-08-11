@@ -1,46 +1,68 @@
-#!/bin/bash
+#!/bin/sh
+set -eu
 
-install_dependencies() {
-    local package_manager=$1
-    local debian_packages=(
-        curl sudo openssl qrencode net-tools procps iptables ca-certificates 
-        python3 python3-pip python3-requests  # 直接通过系统仓库安装核心Python包
-    )
-    local redhat_packages=(
-        curl sudo openssl qrencode net-tools procps iptables ca-certificates 
-        python3 python3-pip
-    )
+RED='\033[31m'
+GREEN='\033[32m'
+RESET='\033[0m'
 
-    echo "正在使用 $package_manager 安装依赖..."
-    if [ "$package_manager" == "apt" ]; then
-        apt update && apt install -y "${debian_packages[@]}"
-        # 禁用Debian的pip保护机制（需要管理员确认风险）
-        rm -f /etc/python3.*/EXTERNALLY-MANAGED 2>/dev/null
-    elif [ "$package_manager" == "dnf" ]; then
-        dnf install -y epel-release
-        dnf install -y "${redhat_packages[@]}"
+if [ "$(id -u)" -ne 0 ]; then
+    printf "%b请使用 root 运行此脚本%b\n" "$RED" "$RESET"
+    exit 1
+fi
+
+if [ ! -r /etc/os-release ]; then
+    printf "%b无法识别系统%b\n" "$RED" "$RESET"
+    exit 1
+fi
+
+. /etc/os-release
+OS_ID=${ID:-unknown}
+
+install_alpine() {
+    echo "检测到 Alpine Linux，正在安装依赖..."
+    apk update
+    apk add --no-cache \
+        bash curl wget ca-certificates openssl qrencode nano \
+        python3 py3-requests openrc iproute2 iptables \
+        coreutils grep procps util-linux
+    update-ca-certificates >/dev/null 2>&1 || true
+    printf "%bAlpine 依赖安装完成%b\n" "$GREEN" "$RESET"
+}
+
+install_debian() {
+    echo "检测到 Debian/Ubuntu，正在安装依赖..."
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        bash curl wget sudo ca-certificates openssl qrencode nano \
+        python3 python3-requests iproute2 iptables procps
+    printf "%b依赖安装完成%b\n" "$GREEN" "$RESET"
+}
+
+install_redhat() {
+    echo "检测到 RHEL 系发行版，正在安装依赖..."
+    if command -v dnf >/dev/null 2>&1; then
+        PM=dnf
+    else
+        PM=yum
     fi
-
-    # 全局安装额外Python依赖（强制模式）
-    python3 -m pip install --break-system-packages -q requests 2>/dev/null
+    "$PM" install -y \
+        bash curl wget sudo ca-certificates openssl qrencode nano \
+        python3 python3-requests iproute iptables procps-ng
+    printf "%b依赖安装完成%b\n" "$GREEN" "$RESET"
 }
 
-check_linux_system() {
-    local os_info=$(grep -i '^id=' /etc/os-release | cut -d= -f2- | tr -d '"')
-
-    case $os_info in
-        ubuntu|debian)
-            install_dependencies "apt"
-            ;;
-        rocky|centos|fedora)
-            install_dependencies "dnf"
-            ;;
-        *)
-            echo -e "\033[31m不支持的Linux发行版\033[0m"
-            exit 1
-            ;;
-    esac
-}
-
-# 调用主函数
-check_linux_system
+case "$OS_ID" in
+    alpine)
+        install_alpine
+        ;;
+    debian|ubuntu)
+        install_debian
+        ;;
+    rocky|centos|fedora|rhel|almalinux)
+        install_redhat
+        ;;
+    *)
+        printf "%b暂不支持发行版: %s%b\n" "$RED" "$OS_ID" "$RESET"
+        exit 1
+        ;;
+esac
