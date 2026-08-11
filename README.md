@@ -16,24 +16,15 @@
 
 ## 安装
 
-将本目录上传到 Alpine VPS，然后以 root 执行：
-
-```sh
-chmod +x install.sh phy2.sh hysteria2.py
-sh install.sh
+**🙃安装脚本2(python版)(推荐):**
 ```
+#执行安装依赖(请执一次依赖安装在进行安装脚本):
 
-安装完成后以后直接输入：
+wget -O phy2.sh https://raw.githubusercontent.com/CINGDAAT/hysteria2/main/phy2.sh && chmod +x phy2.sh && bash phy2.sh
 
-```sh
-hy2
-```
+#执行安装脚本:
 
-也可以分两步执行：
-
-```sh
-sh phy2.sh
-python3 hysteria2.py
+wget -O hy2.py https://raw.githubusercontent.com/CINGDAAT/hysteria2/main/hysteria2.py && chmod +x hy2.py && python3 hy2.py
 ```
 
 ## OpenRC 常用命令
