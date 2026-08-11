@@ -1,6 +1,10 @@
-# hysteria2  一键安装脚本
+#!/usr/bin/env python3
+# Hysteria2 manager with Alpine Linux / OpenRC support.
+# Based on the workflow of seagullz4/hysteria2, reworked to avoid systemd-only assumptions.
+
 import glob
 import ipaddress
+import json
 import os
 import re
 import shlex
@@ -8,730 +12,767 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.request
+import urllib.parse
 from pathlib import Path
-from urllib import parse
 
 try:
     import requests
 except ImportError:
-    print("正在安装 requests 依赖...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "requests"], check=True)
-    import requests
+    print("缺少 requests。Alpine 请先执行: apk add --no-cache py3-requests")
+    sys.exit(1)
+
+CONFIG_DIR = Path("/etc/hysteria")
+CONFIG_FILE = CONFIG_DIR / "config.yaml"
+HY2_DIR = Path("/etc/hy2config")
+URL_FILE = HY2_DIR / "hy2_url_scheme.txt"
+BINARY = Path("/usr/local/bin/hysteria")
+OPENRC_SERVICE = Path("/etc/init.d/hysteria-server")
+OPENRC_IPTABLES_SERVICE = Path("/etc/init.d/hysteria-iptables")
+SYSTEMD_SERVICE = "hysteria-server.service"
+API_URL = "https://api.hy2.io/v1/update"
+REPO_RELEASE = "https://github.com/apernet/hysteria/releases/download/app"
+LATEST_DOWNLOAD = "https://github.com/apernet/hysteria/releases/latest/download"
+
+RED = "\033[91m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+RESET = "\033[0m"
 
 
-def agree_treaty():       #此函数作用为：用户是否同意此条款
-    def hy_shortcut():   #添加hy2快捷键
-        hy2_shortcut = Path(r"/usr/local/bin/hy2")  # 创建快捷方式
-        hy2_shortcut.write_text("#!/bin/bash\nwget -O hy2.py https://raw.githubusercontent.com/seagullz4/hysteria2/main/hysteria2.py && chmod +x hy2.py && python3 hy2.py\n")  # 写入内容
-        hy2_shortcut.chmod(0o755)
-    file_agree = Path(r"/etc/hy2config/agree.txt")  # 提取文件名
-    if file_agree.exists():       #.exists()判断文件是否存在，存在则为true跳过此步骤
-        print("你已经同意过谢谢")
-        hy_shortcut()
+def run(cmd, check=False, capture_output=False, text=True, **kwargs):
+    return subprocess.run(cmd, check=check, capture_output=capture_output, text=text, **kwargs)
+
+
+def is_root():
+    return os.geteuid() == 0
+
+
+def os_id():
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if line.startswith("ID="):
+                return line.split("=", 1)[1].strip().strip('"').lower()
+    except OSError:
+        pass
+    return "unknown"
+
+
+def is_alpine():
+    return os_id() == "alpine"
+
+
+def service_backend():
+    if is_alpine() and shutil.which("rc-service"):
+        return "openrc"
+    if shutil.which("systemctl"):
+        return "systemd"
+    if shutil.which("rc-service"):
+        return "openrc"
+    return "unknown"
+
+
+def ensure_dirs():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    HY2_DIR.mkdir(parents=True, exist_ok=True)
+    URL_FILE.touch(exist_ok=True)
+
+
+def yaml_q(value):
+    """JSON strings are valid YAML scalars and safely quote user input."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def detect_arch():
+    machine = os.uname().machine.lower()
+    mapping = {
+        "i386": "386", "i686": "386",
+        "amd64": "amd64", "x86_64": "amd64",
+        "armv5tel": "arm", "armv6l": "arm", "armv7": "arm", "armv7l": "arm",
+        "armv8": "arm64", "aarch64": "arm64",
+        "mips": "mipsle", "mipsle": "mipsle", "mips64": "mipsle", "mips64le": "mipsle",
+        "s390x": "s390x", "loongarch64": "loong64", "riscv64": "riscv64",
+    }
+    if machine not in mapping:
+        raise RuntimeError(f"暂不支持 CPU 架构: {machine}")
+    return mapping[machine]
+
+
+def get_latest_version(arch):
+    params = {
+        "cver": "installscript",
+        "plat": "linux",
+        "arch": arch,
+        "chan": "release",
+        "side": "server",
+    }
+    r = requests.get(API_URL, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+
+    def find_lver(obj):
+        if isinstance(obj, dict):
+            value = obj.get("lver")
+            if isinstance(value, str):
+                return value
+            for item in obj.values():
+                found = find_lver(item)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = find_lver(item)
+                if found:
+                    return found
+        return None
+
+    version = find_lver(data)
+    if not version or not re.fullmatch(r"v\d+\.\d+\.\d+", version):
+        raise RuntimeError(f"Hysteria API 返回了无法识别的版本: {version!r}")
+    return version
+
+
+def download_binary(version=None):
+    arch = detect_arch()
+    ensure_dirs()
+    if version:
+        version = version if version.startswith("v") else f"v{version}"
+        if not re.fullmatch(r"v\d+\.\d+\.\d+", version):
+            raise ValueError("版本号格式无效，应类似 2.6.0 或 v2.6.0")
     else:
-        while True:
-            print("我同意使用本程序必循遵守部署服务器所在地、所在国家和用户所在国家的法律法规, 程序作者不对使用者任何不当行为负责。且本程序仅供学习交流使用，不得用于任何商业用途。")
-            choose_1 = input("是否同意并阅读(在上面)安装hysteria2相关条款 [y/n]：")
-            if choose_1 == "y":
-                # 使用 mkdir -p 防止目录已存在时命令整体失败
-                subprocess.run("mkdir -p /etc/hy2config && touch /etc/hy2config/agree.txt && touch /etc/hy2config/hy2_url_scheme.txt", shell=True)
-                #当用户同意安装时创建该文件，下次自动检查时跳过此步骤
-                hy_shortcut()
-                break
-            elif choose_1 == "n":
-                print("清同意此条款进行安装")
-                sys.exit()
-            else:
-                print("\033[91m请输入正确选项！\033[m")
+        try:
+            version = get_latest_version(arch)
+        except Exception as exc:
+            print(f"{YELLOW}获取最新版本号失败，将尝试 latest 下载地址: {exc}{RESET}")
+            version = None
 
-def hysteria2_install():    #安装hysteria2
-    while True:
-        choice_1 = input("是否安装/更新hysteria2 [y/n] ：")
-        if choice_1 == "y":
-            print("1. 默认安装最新版本\n2. 安装指定版本")
-            choice_2 = input("请输入选项：")
-            if choice_2 == "1":
-                subprocess.run("bash <(curl -fsSL https://get.hy2.sh/)", shell=True, executable="/bin/bash")  # 调用hy2官方脚本进行安装
-                print("--------------")
-                print("\033[91mhysteria2安装完成,请进行配置一键修改\033[m")
-                print("--------------")
-                hysteria2_config()
-                break
-            elif choice_2 == "2":
-                version_1 = input("请输入您需要安装的版本号(直接输入版本号数字即可，不需要加v，如2.6.0)：")
-                # 验证版本号格式，防止命令注入
-                if not re.match(r'^[0-9]+\.[0-9]+\.[0-9]+$', version_1):
-                    print("\033[91m版本号格式无效，请输入如 2.6.0 的格式\033[m")
-                    continue
-                subprocess.run(f"bash <(curl -fsSL https://get.hy2.sh/) --version v{version_1}", shell=True, executable="/bin/bash")  # 进行指定版本进行安装
-                print("--------------")
-                print(f"\033[91mhysteria2指定{version_1}版本安装完成,请输入选项进行配置一键修改！！！\033[m")
-                print("--------------")
-                hysteria2_config()
-                break
-            else:
-                print("\033[91m输入错误，请重新输入\033[m")
-        elif choice_1 == "n":
-            print("已取消安装hysteria2")
-            break
+    if version:
+        url = f"{REPO_RELEASE}/{version}/hysteria-linux-{arch}"
+        version_label = version
+    else:
+        url = f"{LATEST_DOWNLOAD}/hysteria-linux-{arch}"
+        version_label = "latest"
+
+    tmp = Path("/tmp/hysteria-download")
+    print(f"正在下载 Hysteria2 ({version_label}, {arch}) ...")
+    with requests.get(url, stream=True, timeout=60, allow_redirects=True) as r:
+        r.raise_for_status()
+        with tmp.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+    tmp.chmod(0o755)
+
+    # Basic sanity check before replacing a working binary.
+    check = run([str(tmp), "version"], capture_output=True)
+    if check.returncode != 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError("下载的 Hysteria 可执行文件校验失败")
+
+    BINARY.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(tmp, BINARY)
+    BINARY.chmod(0o755)
+    tmp.unlink(missing_ok=True)
+    print(f"{GREEN}Hysteria2 已安装到 {BINARY}{RESET}")
+    print(check.stdout.strip())
+
+
+def install_openrc_service():
+    if not is_alpine():
+        return
+    if not shutil.which("rc-service"):
+        raise RuntimeError("未找到 OpenRC，请先执行 apk add --no-cache openrc")
+
+    content = r'''#!/sbin/openrc-run
+name="hysteria-server"
+description="Hysteria 2 server"
+command="/usr/local/bin/hysteria"
+command_args="server -c /etc/hysteria/config.yaml"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/hysteria-server.log"
+error_log="/var/log/hysteria-server.err"
+start_stop_daemon_args="--stdout ${output_log} --stderr ${error_log}"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    checkpath --file --mode 0644 "${output_log}"
+    checkpath --file --mode 0644 "${error_log}"
+    if [ ! -r /etc/hysteria/config.yaml ]; then
+        eerror "Missing /etc/hysteria/config.yaml"
+        return 1
+    fi
+}
+'''
+    OPENRC_SERVICE.write_text(content)
+    OPENRC_SERVICE.chmod(0o755)
+    run(["rc-update", "add", "hysteria-server", "default"], check=False)
+
+
+def install_systemd_via_official(version=None):
+    """Keep compatibility for non-Alpine systems using the official installer."""
+    cmd = "bash <(curl -fsSL https://get.hy2.sh/)"
+    if version:
+        version = version if version.startswith("v") else f"v{version}"
+        cmd += f" --version {shlex.quote(version)}"
+    cp = run(cmd, shell=True, executable="/bin/bash")
+    if cp.returncode != 0:
+        raise RuntimeError("官方 Hysteria 安装脚本执行失败")
+
+
+def install_hysteria(version=None):
+    if is_alpine():
+        download_binary(version)
+        install_openrc_service()
+    else:
+        install_systemd_via_official(version)
+
+
+def service_enable_start():
+    backend = service_backend()
+    if backend == "openrc":
+        install_openrc_service()
+        run(["rc-update", "add", "hysteria-server", "default"], check=False)
+        return run(["rc-service", "hysteria-server", "start"]).returncode == 0
+    if backend == "systemd":
+        return run(["systemctl", "enable", "--now", SYSTEMD_SERVICE]).returncode == 0
+    print(f"{RED}未检测到 systemd 或 OpenRC{RESET}")
+    return False
+
+
+def service_action(action):
+    backend = service_backend()
+    if backend == "openrc":
+        if action == "enable-start":
+            return service_enable_start()
+        mapped = {"start": "start", "stop": "stop", "restart": "restart", "status": "status"}
+        if action in mapped:
+            return run(["rc-service", "hysteria-server", mapped[action]]).returncode == 0
+    elif backend == "systemd":
+        mapped = {"start": "start", "stop": "stop", "restart": "restart", "status": "status"}
+        if action == "enable-start":
+            return service_enable_start()
+        if action in mapped:
+            return run(["systemctl", mapped[action], SYSTEMD_SERVICE]).returncode == 0
+    print(f"{RED}当前系统没有可用的服务管理器{RESET}")
+    return False
+
+
+def show_logs():
+    backend = service_backend()
+    if backend == "openrc":
+        out = Path("/var/log/hysteria-server.log")
+        err = Path("/var/log/hysteria-server.err")
+        print("===== stdout =====")
+        if out.exists():
+            run(["tail", "-n", "100", str(out)])
         else:
-            print("\033[91m输入错误，请重新输入\033[m")
-
-def hysteria2_uninstall():   #卸载hysteria2
-    while True:
-        choice_1 = input("是否进行卸载hysteria2 [y/n] ：")
-        if choice_1 == "y":
-            subprocess.run("bash <(curl -fsSL https://get.hy2.sh/) --remove", shell=True, executable="/bin/bash")   #调用hy2官方脚本进行卸载
-            # 停止并禁用iptables恢复服务
-            subprocess.run(["systemctl", "stop", "hysteria-iptables.service"], stderr=subprocess.DEVNULL)
-            subprocess.run(["systemctl", "disable", "hysteria-iptables.service"], stderr=subprocess.DEVNULL)
-            # 清理iptables规则
-            subprocess.run(["/bin/bash", "/etc/hy2config/jump_port_back.sh"], stderr=subprocess.DEVNULL)
-            # 删除所有配置文件和服务
-            
-            # 使用glob处理通配符模式
-            wildcard_paths = glob.glob("/etc/systemd/system/multi-user.target.wants/hysteria-server@*.service")
-            for path in wildcard_paths:
-                try:
-                    Path(path).unlink(missing_ok=True)
-                except Exception:
-                    pass
-            
-            # 删除其他路径
-            paths_to_remove = [
-                "/etc/hysteria",
-                "/etc/systemd/system/multi-user.target.wants/hysteria-server.service",
-                "/etc/systemd/system/hysteria-iptables.service",
-                "/etc/hy2config/iptables-rules.v4",
-                "/etc/hy2config/iptables-rules.v6",
-                "/etc/ssl/private/",
-                "/etc/hy2config",
-                "/usr/local/bin/hy2"
-            ]
-            for path_str in paths_to_remove:
-                try:
-                    path = Path(path_str)
-                    if path.is_file():
-                        path.unlink(missing_ok=True)
-                    elif path.is_dir():
-                        shutil.rmtree(path, ignore_errors=True)
-                except Exception:
-                    pass
-            
-            subprocess.run(["systemctl", "daemon-reload"])
-            print("卸载hysteria2完成")
-            sys.exit()
-        elif choice_1 == "n":
-            print("已取消卸载hysteria2")
-            break
+            print("暂无日志")
+        print("===== stderr =====")
+        if err.exists():
+            run(["tail", "-n", "100", str(err)])
         else:
-            print("\033[91m输入错误，请重新输入\033[m")
+            print("暂无错误日志")
+    elif backend == "systemd":
+        run(["journalctl", "--no-pager", "-e", "-u", SYSTEMD_SERVICE])
 
-def server_manage():   #hysteria2服务管理
+
+def install_shortcut():
+    target_dir = Path("/usr/local/lib/hysteria2")
+    target = target_dir / "hysteria2.py"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        current = Path(__file__).resolve()
+        if current != target:
+            shutil.copy2(current, target)
+            target.chmod(0o755)
+        elif not target.exists():
+            shutil.copy2(current, target)
+    except Exception as exc:
+        print(f"{YELLOW}保存 hy2 管理脚本失败: {exc}{RESET}")
+        return
+
+    wrapper = Path("/usr/local/bin/hy2")
+    wrapper.write_text("#!/bin/sh\nexec python3 /usr/local/lib/hysteria2/hysteria2.py \"$@\"\n")
+    wrapper.chmod(0o755)
+
+
+def agree_treaty():
+    ensure_dirs()
+    agree_file = HY2_DIR / "agree.txt"
+    if agree_file.exists():
+        install_shortcut()
+        return
     while True:
-            print("1. 启动服务(自动设置为开机自启动)\n2. 停止服务\n3. 重启服务\n4. 查看服务状态\n5. 日志查询\n6. 查看hy2版本具体信息\n0. 返回")
-            choice_2 = input("请输入选项：")
-            if choice_2 == "1":
-                subprocess.run("systemctl enable --now hysteria-server.service", shell=True)
-            elif choice_2 == "2":
-                subprocess.run("systemctl stop hysteria-server.service", shell=True)
-            elif choice_2 == "3":
-                subprocess.run("systemctl restart hysteria-server.service", shell=True)
-            elif choice_2 == "4":
-                print("\033[91m输入q退出查看\033[m")
-                subprocess.run("systemctl status hysteria-server.service", shell=True)
-            elif choice_2 == "5":
-                subprocess.run("journalctl --no-pager -e -u hysteria-server.service", shell=True)
-            elif choice_2 == "6":
-                os.system("/usr/local/bin/hysteria version")
-            elif choice_2 == "0":
-                break
-            else:
-                print("\033[91m输入错误，请重新输入\033[m")
+        print("我同意使用本程序时遵守部署服务器所在地、所在国家和用户所在国家的法律法规；本程序仅供学习交流使用。")
+        choice = input("是否同意并继续安装 Hysteria2 [y/n]：").strip().lower()
+        if choice == "y":
+            agree_file.touch()
+            install_shortcut()
+            return
+        if choice == "n":
+            sys.exit(0)
+        print(f"{RED}请输入 y 或 n{RESET}")
+
 
 def create_iptables_persistence_service():
-    """创建systemd服务以在启动时恢复iptables规则"""
-    # 创建恢复脚本，包含错误处理
-    restore_script_content = """#!/bin/bash
-# Hysteria2 iptables rules restoration script
-
-set -e  # 遇到错误时退出
-
-# 验证并恢复IPv4规则
-if [ -f /etc/hy2config/iptables-rules.v4 ]; then
-    if [ -s /etc/hy2config/iptables-rules.v4 ]; then
-        if iptables-restore -t < /etc/hy2config/iptables-rules.v4 2>/dev/null; then
-            iptables-restore < /etc/hy2config/iptables-rules.v4
-            echo "IPv4 iptables规则恢复成功" | logger -t hysteria2-iptables
-        else
-            echo "IPv4 iptables规则文件无效，跳过恢复" | logger -t hysteria2-iptables
-        fi
-    fi
+    restore_script = HY2_DIR / "restore-iptables.sh"
+    restore_script.write_text(r'''#!/bin/sh
+set -e
+if [ -s /etc/hy2config/iptables-rules.v4 ]; then
+    iptables-restore < /etc/hy2config/iptables-rules.v4
 fi
-
-# 验证并恢复IPv6规则
-if [ -f /etc/hy2config/iptables-rules.v6 ]; then
-    if [ -s /etc/hy2config/iptables-rules.v6 ]; then
-        if ip6tables-restore -t < /etc/hy2config/iptables-rules.v6 2>/dev/null; then
-            ip6tables-restore < /etc/hy2config/iptables-rules.v6
-            echo "IPv6 ip6tables规则恢复成功" | logger -t hysteria2-iptables
-        else
-            echo "IPv6 ip6tables规则文件无效，跳过恢复" | logger -t hysteria2-iptables
-        fi
-    fi
+if command -v ip6tables-restore >/dev/null 2>&1 && [ -s /etc/hy2config/iptables-rules.v6 ]; then
+    ip6tables-restore < /etc/hy2config/iptables-rules.v6
 fi
+''')
+    restore_script.chmod(0o755)
 
-exit 0
-"""
-    restore_script_path = Path("/etc/hy2config/restore-iptables.sh")
-    
-    # 创建systemd服务
-    service_content = """[Unit]
-Description=Restore Hysteria2 iptables rules
-After=network.target
+    if service_backend() == "openrc":
+        content = r'''#!/sbin/openrc-run
+description="Restore Hysteria2 iptables rules"
 
-[Service]
-Type=oneshot
-ExecStart=/etc/hy2config/restore-iptables.sh
-RemainAfterExit=true
+depend() {
+    need localmount
+    before hysteria-server
+}
 
-[Install]
-WantedBy=multi-user.target
-"""
-    service_path = Path("/etc/systemd/system/hysteria-iptables.service")
-    try:
-        # 写入恢复脚本
-        restore_script_path.write_text(restore_script_content)
-        restore_script_path.chmod(0o755)
-        
-        # 写入服务文件
-        service_path.write_text(service_content)
-        
-        # 重新加载systemd并启用服务
-        subprocess.run(["systemctl", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "enable", "hysteria-iptables.service"], check=True)
-        print("已创建iptables持久化服务")
-    except Exception as e:
-        print(f"\033[91m创建iptables持久化服务失败: {e}\033[m")
+start() {
+    ebegin "Restoring Hysteria2 iptables rules"
+    /etc/hy2config/restore-iptables.sh
+    eend $?
+}
+'''
+        OPENRC_IPTABLES_SERVICE.write_text(content)
+        OPENRC_IPTABLES_SERVICE.chmod(0o755)
+        run(["rc-update", "add", "hysteria-iptables", "default"], check=False)
+        print("已创建 OpenRC iptables 持久化服务")
+    elif service_backend() == "systemd":
+        service_path = Path("/etc/systemd/system/hysteria-iptables.service")
+        service_path.write_text("""[Unit]\nDescription=Restore Hysteria2 iptables rules\nBefore=hysteria-server.service\nAfter=network.target\n\n[Service]\nType=oneshot\nExecStart=/etc/hy2config/restore-iptables.sh\nRemainAfterExit=true\n\n[Install]\nWantedBy=multi-user.target\n""")
+        run(["systemctl", "daemon-reload"], check=False)
+        run(["systemctl", "enable", "hysteria-iptables.service"], check=False)
+
 
 def save_iptables_rules():
-    """保存当前的iptables和ip6tables规则"""
+    ensure_dirs()
     try:
-        # 创建配置目录
-        config_dir = Path("/etc/hy2config")
-        config_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 保存IPv4规则
-        with open("/etc/hy2config/iptables-rules.v4", "w") as f:
-            subprocess.run(["iptables-save"], stdout=f, check=True, text=True)
-        print("已保存IPv4 iptables规则")
-        
-        # 保存IPv6规则
-        with open("/etc/hy2config/iptables-rules.v6", "w") as f:
-            subprocess.run(["ip6tables-save"], stdout=f, check=True, text=True)
-        print("已保存IPv6 ip6tables规则")
-        
+        with (HY2_DIR / "iptables-rules.v4").open("w") as f:
+            run(["iptables-save"], check=True, stdout=f)
+        if shutil.which("ip6tables-save"):
+            try:
+                with (HY2_DIR / "iptables-rules.v6").open("w") as f:
+                    run(["ip6tables-save"], check=True, stdout=f)
+            except Exception as exc:
+                print(f"{YELLOW}IPv6 规则保存失败，继续保留 IPv4 持久化: {exc}{RESET}")
+                (HY2_DIR / "iptables-rules.v6").unlink(missing_ok=True)
+        create_iptables_persistence_service()
         return True
-    except Exception as e:
-        print(f"\033[91m保存iptables规则失败: {e}\033[m")
+    except Exception as exc:
+        print(f"{RED}保存 iptables 规则失败: {exc}{RESET}")
         return False
 
 
-def _validate_port(prompt_msg):
-    """统一的端口号验证辅助函数，返回有效的端口号（1~65535）"""
+def cleanup_port_hopping():
+    script = HY2_DIR / "jump_port_back.sh"
+    if script.exists():
+        run(["/bin/sh", str(script)], check=False, stderr=subprocess.DEVNULL)
+        script.unlink(missing_ok=True)
+
+
+def validate_port(prompt):
     while True:
         try:
-            port = int(input(prompt_msg))
+            port = int(input(prompt))
             if 1 <= port <= 65535:
                 return port
-            else:
-                print("端口号范围为1~65535，请重新输入")
         except ValueError:
-            print("端口号只能为数字且不能包含小数点，请重新输入")
+            pass
+        print("端口号范围必须是 1~65535")
 
 
-def hysteria2_config():     #hysteria2配置
-    hy2_config = Path(r"/etc/hysteria/config.yaml")  # 配置文件路径
-    hy2_url_scheme = Path(r"/etc/hy2config/hy2_url_scheme.txt")  # 配置文件路径
+def configure_port_hopping(target_port):
+    choice = input("是否开启端口跳跃 [y/n]：").strip().lower()
+    if choice != "y":
+        return ""
+
+    result = run(["ip", "-o", "link", "show"], capture_output=True)
+    if result.returncode == 0:
+        print("可用网络接口：")
+        for line in result.stdout.splitlines():
+            parts = line.split(":", 2)
+            if len(parts) >= 2:
+                print(" -", parts[1].strip())
+    iface = input("请输入 IPv4 网络接口名称（常见 eth0）：").strip()
+
     while True:
-        choice_1 = input("1. hy2配置查看\n2. hy2配置一键修改\n3. 手动修改hy2配置\n4. 性能优化(可选,推荐安装xanmod内核)\n0. 返回\n请输入选项：")
-        if choice_1 == "1":
-            while True:
-                    try:
-                        os.system("clear")
-                        print("您的官方配置文件为：\n")
-                        print(hy2_config.read_text())
-                        print(hy2_url_scheme.read_text())
-                        print("clash,surge,singbox模板在/etc/hy2config/下，请自行查看\n")
-                        break
-                    except FileNotFoundError:     #捕获错误，如果找不到配置文件则输出未找到配置文件
-                        print("\033[91m未找到配置文件\033[m")
-                    break
-        elif choice_1 == "2":
-            try:
-                hy2_port = _validate_port("请输入端口号：")
-                hy2_username = input("请输入您用户名：\n")
-                hy2_username = urllib.parse.quote(hy2_username)
-                hy2_passwd = input("请输入您的强密码：\n")
-                hy2_url = input("请输入您需要伪装成的域名(请在前面加上https://)：\n")
-                while True:
-                    hy2_brutal = input("是否开启Brutal模式(默认不推荐开启)？[y/n]：")
-                    if hy2_brutal == "y":
-                        brutal_mode = "true"    # 修复：y=开启=ignoreClientBandwidth: true
-                        break
-                    elif hy2_brutal == "n":
-                        brutal_mode = "false"   # 修复：n=关闭=ignoreClientBandwidth: false
-                        break
-                    else:
-                        print("\033[91m输入错误请重新输入\033[m")
-                while True:
-                    hy2_obfs = input("是否开启混淆模式(默认不推荐开启，开启将会失去伪装能力)？[y/n]：")
-                    if hy2_obfs == "y":
-                        obfs_passwd = input("请输入您的混淆密码：\n")
-                        obfs_mode = f"obfs:\n  type: salamander\n  \n  salamander:\n    password: {obfs_passwd}"
-                        obfs_passwd = urllib.parse.quote(obfs_passwd)
-                        obfs_scheme = f"&obfs=salamander&obfs-password={obfs_passwd}"
-                        break
-                    elif hy2_obfs == "n":
-                        obfs_mode = ""
-                        obfs_scheme = ""
-                        break
-                    else:
-                        print("\033[91m输入错误请重新输入\033[m")
-                while True:
-                    hy2_sniff = input("是否开启协议嗅探 (Sniff)[y/n]：")
-                    if hy2_sniff == "y":
-                        sniff_mode = "sniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443,8000-9000\n  udpPorts: all"
-                        break
-                    elif hy2_sniff == "n":
-                        sniff_mode = ""
-                        break
-                    else:
-                        print("\033[91m输入错误请重新输入\033[m")
-                while True:
-                    jump_port_choice = input("是否开启端口跳跃(y/n)：")
-                    if jump_port_choice == "y":
-                        print("请选择你的v4网络接口（默认eth0, 一般不是lo接口）")
-                        # 显示可用网络接口
-                        result = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True)
-                        if result.returncode == 0:
-                            for line in result.stdout.strip().split('\n'):
-                                # 提取接口名称
-                                if ':' in line:
-                                    parts = line.split(':', 2)
-                                    if len(parts) >= 2:
-                                        print(f"  - {parts[1].strip()}")
-                        interface_name = input("请输入您的网络接口名称：")
-                        # 将端口输入放入循环，验证失败可重新输入
-                        while True:
-                            try:
-                                first_port = int(input("请输入起始端口号："))
-                                last_port = int(input("请输入结束端口号："))
-                                if first_port < 1 or first_port > 65535:
-                                    print("起始端口号范围为1~65535，请重新输入")
-                                    continue
-                                elif last_port < 1 or last_port > 65535:
-                                    print("结束端口号范围为1~65535，请重新输入")
-                                    continue
-                                elif first_port > last_port:
-                                    print("起始端口号不能大于结束端口号，请重新输入")
-                                    continue
-                                else:
-                                    break  # 验证通过，跳出端口输入循环
-                            except ValueError:
-                                print("端口号只能为数字且不能包含小数点，请重新输入")
-
-                        # 初始化IPv6变量
-                        has_ipv6 = False
-                        ipv6_interface = None
-
-                        while True:
-                            jump_port_ipv6 = input("是否开启ipv6端口跳跃(y/n)：")
-                            if jump_port_ipv6 == "y":
-                                print("请选择你的v6网络接口:")
-                                # 显示可用网络接口
-                                result = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True)
-                                if result.returncode == 0:
-                                    for line in result.stdout.strip().split('\n'):
-                                        if ':' in line:
-                                            parts = line.split(':', 2)
-                                            if len(parts) >= 2:
-                                                print(f"  - {parts[1].strip()}")
-                                interface6_name = input("请输入您的v6网络接口名称：")
-                                subprocess.run(["ip6tables", "-t", "nat", "-A", "PREROUTING", "-i", interface6_name,
-                                              "-p", "udp", "--dport", f"{first_port}:{last_port}",
-                                              "-j", "REDIRECT", "--to-ports", str(hy2_port)])
-                                # 记录IPv6配置信息用于清理脚本
-                                has_ipv6 = True
-                                ipv6_interface = interface6_name
-                                break
-                            elif jump_port_ipv6 == "n":
-                                has_ipv6 = False
-                                ipv6_interface = None
-                                break
-                            else:
-                                print("\033[91m输入错误请重新输入\033[m")
-                        script_path = Path("/etc/hy2config/jump_port_back.sh")  #检恢复脚本是否存在
-                        if script_path.exists():
-                            subprocess.run(["/bin/bash", str(script_path)], stderr=subprocess.DEVNULL)
-                            script_path.unlink(missing_ok=True)
-
-                        # 应用iptables规则
-                        subprocess.run(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", interface_name,
-                                      "-p", "udp", "--dport", f"{first_port}:{last_port}",
-                                      "-j", "REDIRECT", "--to-ports", str(hy2_port)])
-
-                        # 创建清理脚本
-                        jump_port_back = Path("/etc/hy2config/jump_port_back.sh")
-                        cleanup_script = f"""#!/bin/sh
-# Hysteria2 port hopping cleanup script
-iptables -t nat -D PREROUTING -i {interface_name} -p udp --dport {first_port}:{last_port} -j REDIRECT --to-ports {hy2_port}
-"""
-                        if has_ipv6 and ipv6_interface:
-                            cleanup_script += f"ip6tables -t nat -D PREROUTING -i {ipv6_interface} -p udp --dport {first_port}:{last_port} -j REDIRECT --to-ports {hy2_port}\n"
-
-                        jump_port_back.write_text(cleanup_script)
-                        jump_port_back.chmod(0o755)  # 更安全的权限设置
-
-                        # 保存iptables规则以实现持久化
-                        print("正在保存iptables规则以实现重启后自动恢复...")
-                        if save_iptables_rules():
-                            # 创建systemd服务以在启动时恢复规则
-                            create_iptables_persistence_service()
-                            print("\033[92m端口跳跃规则已配置并持久化，系统重启后将自动恢复\033[m")
-                        else:
-                            print("\033[91m警告：iptables规则已应用但持久化失败，系统重启后可能需要重新配置\033[m")
-
-                        jump_ports_hy2 = f"&mport={first_port}-{last_port}"
-                        break
-                    elif jump_port_choice == "n":
-                        jump_ports_hy2 = ""
-                        break
-                    else:
-                        print("\033[91m输入错误请重新输入\033[m")
-
-                # 初始化证书相关变量
-                hy2_domain = ""
-                domain_name = ""
-                insecure = ""
-
-                while True:
-                    print("1. 自动申请域名证书\n2. 使用自签证书(不需要域名)\n3. 手动选择证书路径")
-                    choice_2 = input("请输入您选项：")
-                    if choice_2 == "1":
-                        hy2_domain = input("请输入您自己的域名：\n")
-                        domain_name = hy2_domain    # 修复：不再覆盖为空字符串
-                        hy2_email = input("请输入您的邮箱：\n")
-                        while True:
-                            choice_acme = input("是否设置acme dns配置(如果不知道是什么请不要选择) [y/n]:")
-                            if choice_acme == 'y':
-                                while True:
-                                    os.system('clear')
-                                    dns_name = input("dns名称：\n1.Cloudflare\n2.Duck DNS\n3.Gandi.net\n4.Godaddy\n5.Name.com\n6.Vultr\n请输入您的选项：")
-                                    if dns_name == '1':
-                                        dns_token = input("请输入Cloudflare的Global api_token:")
-                                        acme_dns = f"type: dns\n  dns:\n    name: cloudflare\n    config:\n      cloudflare_api_token: {dns_token}"
-                                        break
-                                    elif dns_name == '2':
-                                        dns_token = input("请输入Duck DNS的api_token:")
-                                        override_domain = input("请输入Duck DNS的override_domain:")
-                                        acme_dns = f"type: dns\n  dns:\n    name: duckdns\n    config:\n      duckdns_api_token: {dns_token}\n    duckdns_override_domain: {override_domain}"
-                                        break
-                                    elif dns_name == '3':
-                                        dns_token = input("请输入Gandi.net的api_token:")
-                                        acme_dns = f"type: dns\n  dns:\n    name: gandi\n    config:\n      gandi_api_token: {dns_token}"
-                                        break
-                                    elif dns_name == '4':
-                                        dns_token = input("请输入Godaddy的api_token:")
-                                        acme_dns = f"type: dns\n  dns:\n    name: godaddy\n    config:\n      godaddy_api_token: {dns_token}"
-                                        break
-                                    elif dns_name == '5':
-                                        dns_token = input("请输入Name.com的namedotcom_token:")
-                                        dns_user = input("请输入Name.com的namedotcom_user:")
-                                        namedotcom_server = input("请输入Name.com的namedotcom_server:")
-                                        acme_dns = f"type: dns\n  dns:\n    name: {dns_name}\n    config:\n      namedotcom_token: {dns_token}\n      namedotcom_user: {dns_user}\n      namedotcom_server: {namedotcom_server}"
-                                        break
-                                    elif dns_name == '6':
-                                        dns_token = input("请输入Vultr的API Key:")
-                                        acme_dns = f"type: dns\n  dns:\n    name: {dns_name}\n    config:\n      vultr_api_key: {dns_token}"
-                                        break
-                                    else:
-                                        print("输入错误，请重新输入")
-                                break
-                            elif choice_acme == 'n':
-                                acme_dns = ""
-                                break
-                            else:
-                                print("输入错误，请重新输入")
-                        insecure = "&insecure=0"
-                        hy2_config.write_text(f"listen: :{hy2_port}\n\nacme:\n  domains:\n    - {hy2_domain}\n  email: {hy2_email}\n  {acme_dns}\n\nauth:\n  type: password\n  password: {hy2_passwd}\n\nmasquerade:\n  type: proxy\n  proxy:\n    url: {hy2_url}\n    rewriteHost: true\n\nignoreClientBandwidth: {brutal_mode}\n\n{obfs_mode}\n{sniff_mode}\n")
-                        break
-                    elif choice_2 == "2":    #获取ipv4地址
-                        def validate_and_get_ipv4():
-                            """Helper function to get and validate IPv4 address from user"""
-                            while True:
-                                ip_input = input("无法自动获取IP，请手动输入服务器的IPv4地址：").strip()
-                                try:
-                                    # 验证是否为有效的IPv4地址
-                                    ipaddress.IPv4Address(ip_input)
-                                    return ip_input
-                                except ipaddress.AddressValueError:
-                                    print(f"\033[91m无效的IPv4地址: {ip_input}，请重新输入\033[m")
-                        
-                        def validate_and_get_ipv6():
-                            """Helper function to get and validate IPv6 address from user"""
-                            while True:
-                                ip_input = input("无法自动获取IP，请手动输入服务器的IPv6地址：").strip()
-                                try:
-                                    # 验证是否为有效的IPv6地址
-                                    ipaddress.IPv6Address(ip_input)
-                                    return ip_input
-                                except ipaddress.AddressValueError:
-                                    print(f"\033[91m无效的IPv6地址: {ip_input}，请重新输入\033[m")
-                        
-                        def get_ipv4_info():
-                            """获取IPv4地址，返回地址字符串"""
-                            headers = {
-                                'User-Agent': 'Mozilla'
-                            }
-                            try:
-                                response = requests.get('http://ip-api.com/json/', headers=headers, timeout=3)
-                                response.raise_for_status()
-                                ip_data = response.json()
-                                isp = ip_data.get('isp', '')
-
-                                if 'cloudflare' in isp.lower():
-                                    print("检测到Warp，请输入正确的服务器 IPv4 地址")
-                                    ip = validate_and_get_ipv4()
-                                else:
-                                    ip = ip_data.get('query', '')
-
-                                print(f"IPV4 WAN IP: {ip}")
-                                return ip
-
-                            except requests.RequestException as e:
-                                print(f"请求失败: {e}")
-                                print("尝试使用备用方法获取IP地址...")
-                                # 使用备用方法获取IP地址
-                                try:
-                                    result = subprocess.run(['curl', '-4', '-s', 'ifconfig.me'], capture_output=True, text=True, timeout=5)
-                                    if result.returncode == 0 and result.stdout.strip():
-                                        ip = result.stdout.strip()
-                                        # 验证IPv4格式
-                                        try:
-                                            ipaddress.IPv4Address(ip)
-                                            print(f"IPV4 WAN IP: {ip}")
-                                            return ip
-                                        except ipaddress.AddressValueError:
-                                            # 格式无效，让用户手动输入
-                                            return validate_and_get_ipv4()
-                                    else:
-                                        # 如果还是失败，让用户手动输入
-                                        return validate_and_get_ipv4()
-                                except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, FileNotFoundError):
-                                    # 如果备用方法也失败，让用户手动输入
-                                    return validate_and_get_ipv4()
-
-                        def get_ipv6_info():    #获取ipv6地址
-                            """获取IPv6地址，返回带方括号的地址字符串"""
-                            headers = {
-                                'User-Agent': 'Mozilla'
-                            }
-                            try:
-                                response = requests.get('https://api.ip.sb/geoip', headers=headers, timeout=3)
-                                response.raise_for_status()
-                                ip_data = response.json()
-                                isp = ip_data.get('isp', '')
-
-                                if 'cloudflare' in isp.lower():
-                                    print("检测到Warp，请输入正确的服务器 IPv6 地址")
-                                    ipv6_input = validate_and_get_ipv6()
-                                    ip = f"[{ipv6_input}]"
-                                else:
-                                    ip = f"[{ip_data.get('ip', '')}]"
-
-                                print(f"IPV6 WAN IP: {ip}")
-                                return ip
-
-                            except requests.RequestException as e:
-                                print(f"请求失败: {e}")
-                                print("尝试使用备用方法获取IP地址...")
-                                # 使用备用方法获取IPv6地址
-                                try:
-                                    result = subprocess.run(['curl', '-6', '-s', 'ifconfig.me'], capture_output=True, text=True, timeout=5)
-                                    if result.returncode == 0 and result.stdout.strip():
-                                        ip = result.stdout.strip()
-                                        # 验证IPv6格式
-                                        try:
-                                            ipaddress.IPv6Address(ip)
-                                            formatted = f"[{ip}]"
-                                            print(f"IPV6 WAN IP: {formatted}")
-                                            return formatted
-                                        except ipaddress.AddressValueError:
-                                            # 格式无效，让用户手动输入
-                                            ipv6_input = validate_and_get_ipv6()
-                                            return f"[{ipv6_input}]"
-                                    else:
-                                        # 如果还是失败，让用户手动输入
-                                        ipv6_input = validate_and_get_ipv6()
-                                        return f"[{ipv6_input}]"
-                                except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, FileNotFoundError):
-                                    # 如果备用方法也失败，让用户手动输入
-                                    ipv6_input = validate_and_get_ipv6()
-                                    return f"[{ipv6_input}]"
-
-                        def generate_certificate():      #生成自签证书
-                            """生成自签证书，返回使用的域名"""
-                            # 使用循环代替递归，避免栈溢出
-                            while True:
-                                # 提示用户输入域名
-                                user_domain = input("请输入要用于自签名证书的域名（默认为 bing.com）: ")
-                                cert_domain = user_domain.strip() if user_domain else "bing.com"
-
-                                # 验证域名格式
-                                if not re.match(r'^[a-zA-Z0-9.-]+$', cert_domain):
-                                    print("无效的域名格式，请输入有效的域名！")
-                                    continue  # 修复：循环重试而非递归
-
-                                # 定义目标目录
-                                target_dir = "/etc/ssl/private"
-
-                                # 检查并创建目标目录
-                                os.makedirs(target_dir, mode=0o755, exist_ok=True)
-
-                                # 生成 EC 参数文件
-                                ec_param_file = f"{target_dir}/ec_param.pem"
-                                subprocess.run(["openssl", "ecparam", "-name", "prime256v1", "-out", ec_param_file],
-                                               check=True)
-
-                                # 生成证书和私钥
-                                cmd = [
-                                    "openssl", "req", "-x509", "-nodes", "-newkey", f"ec:{ec_param_file}",
-                                    "-keyout", f"{target_dir}/{cert_domain}.key",
-                                    "-out", f"{target_dir}/{cert_domain}.crt",
-                                    "-subj", f"/CN={cert_domain}", "-days", "36500"
-                                ]
-                                subprocess.run(cmd, check=True)
-
-                                # 设置文件权限，确保 hysteria 服务用户可读取
-                                os.chmod(f"{target_dir}/{cert_domain}.key", 0o644)   # 私钥需要 hysteria 用户可读
-                                os.chmod(f"{target_dir}/{cert_domain}.crt", 0o644)   # 证书所有人可读
-                                os.chmod(target_dir, 0o755)                          # 目录权限
-                                # 尝试将证书文件所有权交给 hysteria 用户（如果该用户存在）
-                                subprocess.run(["chown", "root:hysteria",
-                                               f"{target_dir}/{cert_domain}.key",
-                                               f"{target_dir}/{cert_domain}.crt"],
-                                              stderr=subprocess.DEVNULL)
-
-                                print("自签名证书和私钥已生成！")
-                                print(f"证书文件已保存到 {target_dir}/{cert_domain}.crt")
-                                print(f"私钥文件已保存到 {target_dir}/{cert_domain}.key")
-                                return cert_domain
-
-                        domain_name = generate_certificate()
-                        while True:
-                            ip_mode = input("1. ipv4模式\n2. ipv6模式\n请输入您的选项：")
-                            if ip_mode == '1':
-                                hy2_domain = get_ipv4_info()
-                                break
-                            elif ip_mode == '2':
-                                hy2_domain = get_ipv6_info()
-                                break
-                            else:
-                                print("\033[91m输入错误，请重新输入！\033[m")
-                        insecure = "&insecure=1"
-                        hy2_config.write_text(f"listen: :{hy2_port}\n\ntls:\n  cert: /etc/ssl/private/{domain_name}.crt\n  key: /etc/ssl/private/{domain_name}.key\n\nauth:\n  type: password\n  password: {hy2_passwd}\n\nmasquerade:\n  type: proxy\n  proxy:\n    url: {hy2_url}\n    rewriteHost: true\n\nignoreClientBandwidth: {brutal_mode}\n\n{obfs_mode}\n{sniff_mode}\n")
-                        break
-                    elif choice_2 == "3":
-                        hy2_cert = input("请输入您的证书路径：\n")
-                        hy2_key = input("请输入您的密钥路径：\n")
-                        hy2_domain = input("请输入您自己的域名：\n")
-                        domain_name = hy2_domain    # 修复：不再覆盖为空字符串
-                        insecure = "&insecure=0"
-                        hy2_config.write_text(f"listen: :{hy2_port}\n\ntls:\n  cert: {hy2_cert}\n  key: {hy2_key}\n\nauth:\n  type: password\n  password: {hy2_passwd}\n\nmasquerade:\n  type: proxy\n  proxy:\n    url: {hy2_url}\n    rewriteHost: true\n\nignoreClientBandwidth: {brutal_mode}\n\n{obfs_mode}\n{sniff_mode}\n")
-                        break
-                    else:
-                        print("\033[91m输入错误，请重新输入\033[m")
-
-                os.system("clear")
-                hy2_passwd = urllib.parse.quote(hy2_passwd)
-                hy2_v2ray = f"hysteria2://{hy2_passwd}@{hy2_domain}:{hy2_port}?sni={domain_name}{obfs_scheme}{insecure}{jump_ports_hy2}#{hy2_username}"
-                print("您的 v2ray 二维码为：\n")
-                time.sleep(1)
-                # 修复：使用 subprocess 避免命令注入
-                subprocess.run(f'echo {shlex.quote(hy2_v2ray)} | qrencode -s 1 -m 1 -t ANSI256 -o -', shell=True, executable="/bin/bash")
-                print(f"\n\n\033[91m您的hy2链接为: {hy2_v2ray}\n请使用v2ray/nekobox/v2rayNG/nekoray软件导入\033[m\n\n")
-                hy2_url_scheme.write_text(f"您的 v2ray hy2配置链接为：{hy2_v2ray}\n")
-                print("是否需要下载clash/singbox/surge订阅链接生成的模板文件用于导入软件，需要调用到外部链接（您的订阅信息不会被泄露）")
-                choice_3 = input("请输入您的选项（请输入 y/n ）:")
-                if choice_3 == "y":
-                    print("正在下载 clash,sing-box,surge 配置文件到/etc/hy2config/clash.yaml")
-                    hy2_v2ray_url = urllib.parse.quote(hy2_v2ray)
-                    url_rule = "&ua=&selectedRules=%5B%22Location%3ACN%22%2C%22Private%22%2C%22Non-China%22%2C%22Github%22%2C%22Google%22%2C%22Youtube%22%2C%22AI+Services%22%2C%22Telegram%22%2C%22Ad+Block%22%5D&customRules=%5B%5D&include_auto_select=false"
-                    # 修复：使用 subprocess 列表形式避免命令注入
-                    subprocess.run(["curl", "-o", "/etc/hy2config/clash.yaml", f"https://sub.baibaicat.site/clash?config={hy2_v2ray_url}{url_rule}"])
-                    subprocess.run(["curl", "-o", "/etc/hy2config/sing-box.yaml", f"https://sub.baibaicat.site/singbox?config={hy2_v2ray_url}{url_rule}"])
-                    subprocess.run(["curl", "-o", "/etc/hy2config/surge.yaml", f"https://sub.baibaicat.site/surge?config={hy2_v2ray_url}{url_rule}"])
-                    print("\033[91m \nclash,sing-box,surge配置文件已保存到 /etc/hy2config/ 目录下 ！！\n\n \033[m")
-                elif choice_3 == "n":
-                    print("跳过生成订阅链接")
-                else:
-                    print("跳过生成订阅链接")
-                os.system("systemctl enable --now hysteria-server.service")
-                os.system("systemctl restart hysteria-server.service")
-
-            except FileNotFoundError:
-                print("\033[91m未找到配置文件,请先安装hysteria2\033[m")
-        elif choice_1 == "3":
-            print("\033[91m正在使用nano编辑器进行手动修改，输入完成后按Ctrl+X保存退出\033[m")
-            subprocess.run("nano /etc/hysteria/config.yaml", shell=True)   #调用nano编辑器进行手动修改
-            os.system("systemctl enable --now hysteria-server.service")
-            os.system("systemctl restart hysteria-server.service")
-            print("hy2服务已启动")
-        elif choice_1 == "4":
-            os.system("wget -O tcpx.sh 'https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh' && chmod +x tcpx.sh && ./tcpx.sh")
-        elif choice_1 == "0":
+        first = validate_port("请输入起始端口：")
+        last = validate_port("请输入结束端口：")
+        if first <= last:
             break
-        else:
-            print("\033[91m请重新输入\033[m")
+        print("起始端口不能大于结束端口")
+
+    cleanup_port_hopping()
+    run(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", iface, "-p", "udp",
+         "--dport", f"{first}:{last}", "-j", "REDIRECT", "--to-ports", str(target_port)], check=True)
+
+    cleanup_lines = [
+        "#!/bin/sh",
+        f"iptables -t nat -D PREROUTING -i {shlex.quote(iface)} -p udp --dport {first}:{last} -j REDIRECT --to-ports {target_port} 2>/dev/null || true",
+    ]
+
+    if input("是否开启 IPv6 端口跳跃 [y/n]：").strip().lower() == "y" and shutil.which("ip6tables"):
+        iface6 = input("请输入 IPv6 网络接口名称：").strip()
+        run(["ip6tables", "-t", "nat", "-A", "PREROUTING", "-i", iface6, "-p", "udp",
+             "--dport", f"{first}:{last}", "-j", "REDIRECT", "--to-ports", str(target_port)], check=True)
+        cleanup_lines.append(
+            f"ip6tables -t nat -D PREROUTING -i {shlex.quote(iface6)} -p udp --dport {first}:{last} -j REDIRECT --to-ports {target_port} 2>/dev/null || true"
+        )
+
+    script = HY2_DIR / "jump_port_back.sh"
+    script.write_text("\n".join(cleanup_lines) + "\n")
+    script.chmod(0o755)
+    save_iptables_rules()
+    return f"&mport={first}-{last}"
 
 
-def check_hysteria2_version():  # 检查hysteria2版本
+def get_ipv4():
     try:
-        output = subprocess.check_output("/usr/local/bin/hysteria version | grep '^Version' | grep -o 'v[.0-9]*'",shell=True, stderr=subprocess.STDOUT)
-        version = output.decode('utf-8').strip()
+        r = requests.get("https://api.ipify.org", timeout=5)
+        r.raise_for_status()
+        ipaddress.IPv4Address(r.text.strip())
+        return r.text.strip()
+    except Exception:
+        while True:
+            ip = input("无法自动获取 IPv4，请手动输入：").strip()
+            try:
+                ipaddress.IPv4Address(ip)
+                return ip
+            except ipaddress.AddressValueError:
+                print("IPv4 地址无效")
 
-        if "v" in version:
-            print(f"当前hysteria2版本为：{version}")
-        else:
-            print("未找到hysteria2版本")
-    except subprocess.CalledProcessError as e:
-        print(f"命令执行失败: {e.output.decode('utf-8')}")
 
-#接下来写主程序
-agree_treaty()
-while True:
-    os.system("clear")
-    print("\033[91mHELLO HYSTERIA2 !\033[m  (输入hy2快捷启动)")  # 其中 print("\033[91m你需要输入的文字\033[0m") 为ANSI转义码 输出红色文本
-    print("1. 安装/更新hysteria2\n2. 卸载hysteria2\n3. hysteria2配置\n4. hysteria2服务管理\n0. 退出")
-    choice = input("请输入选项：")
-    if choice == "1":
-        os.system("clear")
-        hysteria2_install()
-    elif choice == "2":
-        os.system("clear")
-        hysteria2_uninstall()
-    elif choice == "3":
-        os.system("clear")
-        hysteria2_config()
-    elif choice == "4":
-        os.system("clear")
-        check_hysteria2_version()
-        server_manage()
-    elif choice == "0":
-        print("已退出")
-        sys.exit()
+def get_ipv6():
+    try:
+        r = requests.get("https://api64.ipify.org", timeout=5)
+        r.raise_for_status()
+        ipaddress.IPv6Address(r.text.strip())
+        return f"[{r.text.strip()}]"
+    except Exception:
+        while True:
+            ip = input("无法自动获取 IPv6，请手动输入：").strip()
+            try:
+                ipaddress.IPv6Address(ip)
+                return f"[{ip}]"
+            except ipaddress.AddressValueError:
+                print("IPv6 地址无效")
+
+
+def generate_self_signed_cert():
+    domain = input("请输入自签证书域名（默认 bing.com）：").strip() or "bing.com"
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", domain):
+        raise ValueError("域名格式无效")
+    target = Path("/etc/ssl/private")
+    target.mkdir(parents=True, exist_ok=True)
+    key = target / f"{domain}.key"
+    cert = target / f"{domain}.crt"
+    cmd = [
+        "openssl", "req", "-x509", "-nodes", "-newkey", "ec",
+        "-pkeyopt", "ec_paramgen_curve:prime256v1",
+        "-keyout", str(key), "-out", str(cert),
+        "-subj", f"/CN={domain}", "-days", "36500",
+    ]
+    run(cmd, check=True)
+    key.chmod(0o600)
+    cert.chmod(0o644)
+    return domain, str(cert), str(key)
+
+
+def build_config(port, password, masquerade, brutal, obfs_block, sniff_block, cert_mode):
+    lines = [f"listen: :{port}", ""]
+    if cert_mode[0] == "acme":
+        _, domain, email, acme_dns = cert_mode
+        lines += ["acme:", "  domains:", f"    - {yaml_q(domain)}", f"  email: {yaml_q(email)}"]
+        if acme_dns:
+            lines += acme_dns.splitlines()
+        lines.append("")
     else:
-        print("\033[91m输入错误，请重新输入\033[m")
-        time.sleep(1)
+        _, cert, key = cert_mode
+        lines += ["tls:", f"  cert: {yaml_q(cert)}", f"  key: {yaml_q(key)}", ""]
+
+    lines += [
+        "auth:", "  type: password", f"  password: {yaml_q(password)}", "",
+        "masquerade:", "  type: proxy", "  proxy:", f"    url: {yaml_q(masquerade)}", "    rewriteHost: true", "",
+        f"ignoreClientBandwidth: {'true' if brutal else 'false'}", "",
+    ]
+    if obfs_block:
+        lines += obfs_block.splitlines() + [""]
+    if sniff_block:
+        lines += sniff_block.splitlines() + [""]
+    CONFIG_FILE.write_text("\n".join(lines).rstrip() + "\n")
+
+
+def choose_certificate():
+    while True:
+        print("1. 自动申请域名证书 (ACME)\n2. 使用自签证书\n3. 手动选择证书路径")
+        choice = input("请输入选项：").strip()
+        if choice == "1":
+            domain = input("请输入域名：").strip()
+            if not re.fullmatch(r"[A-Za-z0-9.-]+", domain):
+                print("域名格式无效")
+                continue
+            email = input("请输入邮箱：").strip()
+            acme_dns = ""
+            if input("是否配置 ACME DNS [y/n]：").strip().lower() == "y":
+                print("当前 Alpine 版保留 Hysteria 内置 ACME；DNS 高级配置请安装后手动编辑 config.yaml。")
+            return ("acme", domain, email, acme_dns), domain, "&insecure=0"
+        if choice == "2":
+            domain, cert, key = generate_self_signed_cert()
+            mode = input("1. IPv4 模式\n2. IPv6 模式\n请输入选项：").strip()
+            host = get_ipv6() if mode == "2" else get_ipv4()
+            return ("tls", cert, key), host, f"&sni={urllib.parse.quote(domain)}&insecure=1"
+        if choice == "3":
+            cert = input("请输入证书路径：").strip()
+            key = input("请输入私钥路径：").strip()
+            domain = input("请输入域名：").strip()
+            return ("tls", cert, key), domain, f"&sni={urllib.parse.quote(domain)}&insecure=0"
+        print("输入错误")
+
+
+def configure_hysteria():
+    ensure_dirs()
+    port = validate_port("请输入端口号：")
+    username = input("请输入节点名称：").strip()
+    password = input("请输入强密码：").strip()
+    masquerade = input("请输入伪装网址（例如 https://www.bing.com/）：").strip()
+
+    brutal = input("是否开启 Brutal 模式 [y/n]：").strip().lower() == "y"
+
+    obfs_block = ""
+    obfs_query = ""
+    if input("是否开启 Salamander 混淆 [y/n]：").strip().lower() == "y":
+        obfs_password = input("请输入混淆密码：").strip()
+        obfs_block = f"obfs:\n  type: salamander\n  salamander:\n    password: {yaml_q(obfs_password)}"
+        obfs_query = "&obfs=salamander&obfs-password=" + urllib.parse.quote(obfs_password, safe="")
+
+    sniff_block = ""
+    if input("是否开启协议嗅探 Sniff [y/n]：").strip().lower() == "y":
+        sniff_block = "sniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443,8000-9000\n  udpPorts: all"
+
+    jump_query = configure_port_hopping(port)
+    cert_mode, host, tls_query = choose_certificate()
+
+    # ACME URL still needs SNI.
+    if cert_mode[0] == "acme":
+        domain = cert_mode[1]
+        tls_query = f"&sni={urllib.parse.quote(domain)}&insecure=0"
+
+    build_config(port, password, masquerade, brutal, obfs_block, sniff_block, cert_mode)
+
+    link = (
+        f"hysteria2://{urllib.parse.quote(password, safe='')}@{host}:{port}?"
+        f"{tls_query.lstrip('&')}{obfs_query}{jump_query}#{urllib.parse.quote(username, safe='')}"
+    )
+    URL_FILE.write_text(f"您的 Hysteria2 链接：{link}\n")
+    print("\n您的 Hysteria2 链接：")
+    print(link)
+
+    if shutil.which("qrencode"):
+        run(["qrencode", "-s", "1", "-m", "1", "-t", "ANSI256", "-o", "-", link])
+
+    if input("是否下载 clash/sing-box/surge 转换模板 [y/n]：").strip().lower() == "y":
+        encoded = urllib.parse.quote(link, safe="")
+        rule = "&ua=&selectedRules=%5B%22Location%3ACN%22%2C%22Private%22%2C%22Non-China%22%2C%22Github%22%2C%22Google%22%2C%22Youtube%22%2C%22AI+Services%22%2C%22Telegram%22%2C%22Ad+Block%22%5D&customRules=%5B%5D&include_auto_select=false"
+        for name, endpoint in [("clash.yaml", "clash"), ("sing-box.yaml", "singbox"), ("surge.yaml", "surge")]:
+            try:
+                r = requests.get(f"https://sub.baibaicat.site/{endpoint}?config={encoded}{rule}", timeout=20)
+                r.raise_for_status()
+                (HY2_DIR / name).write_bytes(r.content)
+            except Exception as exc:
+                print(f"{YELLOW}{name} 下载失败: {exc}{RESET}")
+
+    if service_enable_start():
+        service_action("restart")
+        print(f"{GREEN}配置完成，Hysteria2 服务已启动{RESET}")
+    else:
+        print(f"{RED}配置已写入，但服务启动失败，请查看状态/日志{RESET}")
+
+
+def view_config():
+    if not CONFIG_FILE.exists():
+        print("未找到 /etc/hysteria/config.yaml")
+        return
+    print("===== /etc/hysteria/config.yaml =====")
+    print(CONFIG_FILE.read_text())
+    if URL_FILE.exists():
+        print("===== 节点链接 =====")
+        print(URL_FILE.read_text())
+
+
+def manual_edit():
+    editor = shutil.which("nano") or shutil.which("vi")
+    if not editor:
+        print("未找到 nano/vi。Alpine 可执行 apk add nano")
+        return
+    run([editor, str(CONFIG_FILE)])
+    service_action("restart")
+
+
+def enable_bbr():
+    print("Alpine 不安装 XanMod；这里改为尝试启用当前内核自带的 BBR。")
+    if shutil.which("modprobe"):
+        run(["modprobe", "tcp_bbr"], check=False)
+    available = Path("/proc/sys/net/ipv4/tcp_available_congestion_control")
+    if available.exists() and "bbr" not in available.read_text().split():
+        print(f"{YELLOW}当前内核未提供 BBR，请更换/升级 Alpine 内核后再试。{RESET}")
+        return
+    conf = Path("/etc/sysctl.d/99-hysteria2.conf")
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n")
+    run(["sysctl", "-p", str(conf)], check=False)
+    print(f"{GREEN}已写入 BBR sysctl 配置{RESET}")
+
+
+def uninstall_hysteria():
+    if input("是否卸载 Hysteria2 [y/n]：").strip().lower() != "y":
+        return
+    backend = service_backend()
+    cleanup_port_hopping()
+    if backend == "openrc":
+        run(["rc-service", "hysteria-server", "stop"], check=False, stderr=subprocess.DEVNULL)
+        run(["rc-update", "del", "hysteria-server", "default"], check=False, stderr=subprocess.DEVNULL)
+        run(["rc-update", "del", "hysteria-iptables", "default"], check=False, stderr=subprocess.DEVNULL)
+        OPENRC_SERVICE.unlink(missing_ok=True)
+        OPENRC_IPTABLES_SERVICE.unlink(missing_ok=True)
+    elif backend == "systemd":
+        # On non-Alpine, delegate binary/service removal to official installer.
+        run("bash <(curl -fsSL https://get.hy2.sh/) --remove", shell=True, executable="/bin/bash")
+        run(["systemctl", "disable", "--now", "hysteria-iptables.service"], check=False, stderr=subprocess.DEVNULL)
+        Path("/etc/systemd/system/hysteria-iptables.service").unlink(missing_ok=True)
+        run(["systemctl", "daemon-reload"], check=False)
+
+    BINARY.unlink(missing_ok=True)
+    shutil.rmtree(CONFIG_DIR, ignore_errors=True)
+    shutil.rmtree(HY2_DIR, ignore_errors=True)
+    Path("/usr/local/bin/hy2").unlink(missing_ok=True)
+    shutil.rmtree(Path("/usr/local/lib/hysteria2"), ignore_errors=True)
+    print("Hysteria2 已卸载")
+    sys.exit(0)
+
+
+def check_version():
+    if not BINARY.exists():
+        print("Hysteria2 尚未安装")
+        return
+    run([str(BINARY), "version"], check=False)
+
+
+def install_menu():
+    while True:
+        print("1. 安装/更新最新版本\n2. 安装指定版本\n0. 返回")
+        choice = input("请输入选项：").strip()
+        try:
+            if choice == "1":
+                install_hysteria()
+                if is_alpine():
+                    print("Alpine/OpenRC 服务文件已创建；请继续配置。")
+                return
+            if choice == "2":
+                version = input("版本号（例如 2.6.0）：").strip()
+                install_hysteria(version)
+                return
+            if choice == "0":
+                return
+        except Exception as exc:
+            print(f"{RED}安装失败: {exc}{RESET}")
+
+
+def config_menu():
+    while True:
+        print("1. 查看配置\n2. 一键配置\n3. 手动编辑配置\n4. 性能优化/BBR\n0. 返回")
+        choice = input("请输入选项：").strip()
+        try:
+            if choice == "1":
+                view_config()
+            elif choice == "2":
+                configure_hysteria()
+            elif choice == "3":
+                manual_edit()
+            elif choice == "4":
+                enable_bbr()
+            elif choice == "0":
+                return
+            else:
+                print("输入错误")
+        except Exception as exc:
+            print(f"{RED}操作失败: {exc}{RESET}")
+        input("按回车继续...")
+
+
+def server_manage():
+    while True:
+        print("1. 启动并设为开机自启\n2. 停止\n3. 重启\n4. 查看状态\n5. 查看日志\n6. 查看版本\n0. 返回")
+        choice = input("请输入选项：").strip()
+        if choice == "1":
+            service_action("enable-start")
+        elif choice == "2":
+            service_action("stop")
+        elif choice == "3":
+            service_action("restart")
+        elif choice == "4":
+            service_action("status")
+        elif choice == "5":
+            show_logs()
+        elif choice == "6":
+            check_version()
+        elif choice == "0":
+            return
+        else:
+            print("输入错误")
+        input("按回车继续...")
+
+
+def main():
+    if not is_root():
+        print(f"{RED}请使用 root 运行此脚本{RESET}")
+        sys.exit(1)
+
+    if is_alpine():
+        required = ["rc-service", "rc-update", "ip", "iptables", "openssl"]
+        missing = [cmd for cmd in required if not shutil.which(cmd)]
+        if missing:
+            print(f"{RED}缺少 Alpine 依赖: {', '.join(missing)}{RESET}")
+            print("请先执行同目录下: sh phy2.sh")
+            sys.exit(1)
+
+    ensure_dirs()
+    agree_treaty()
+
+    while True:
+        os.system("clear")
+        backend = service_backend()
+        print(f"{RED}HELLO HYSTERIA2 !{RESET}  系统: {os_id()}  服务管理: {backend}")
+        print("1. 安装/更新 Hysteria2\n2. 卸载 Hysteria2\n3. Hysteria2 配置\n4. Hysteria2 服务管理\n0. 退出")
+        choice = input("请输入选项：").strip()
+        if choice == "1":
+            install_menu()
+        elif choice == "2":
+            uninstall_hysteria()
+        elif choice == "3":
+            config_menu()
+        elif choice == "4":
+            check_version()
+            server_manage()
+        elif choice == "0":
+            print("已退出")
+            return
+        else:
+            print("输入错误")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
